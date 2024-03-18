@@ -311,9 +311,7 @@ impl Frame {
         self
     }
 
-    /// Parse a frame from the given slice. This also takes the payload from the
-    /// slice, and copies it to the heap, which may not be ideal for a production
-    /// implementation.
+    /// Parse a frame from the given slice
     pub fn parse(i: Roll) -> IResult<Roll, Self> {
         let (i, (len, frame_type, (reserved, stream_id))) = tuple((
             be_u24,
