@@ -23,7 +23,7 @@ use tracing::{debug, trace};
 
 use crate::{
     h2::{
-        body::{H2Body, H2BodyItem, PieceOrTrailers},
+        body::{H2Body, PieceOrTrailers, StreamIncomingItem},
         encode::{EncoderState, H2Encoder},
         parse::{
             self, parse_reserved_and_u31, ContinuationFlags, DataFlags, Frame, FrameType,
@@ -31,7 +31,7 @@ use crate::{
         },
         types::{
             ConnState, H2ConnectionError, H2Event, H2EventPayload, H2StreamError,
-            HeadersOrTrailers, StreamState,
+            HeadersOrTrailers, StreamOutgoing, StreamState,
         },
     },
     util::read_and_parse,
@@ -428,18 +428,12 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                     // if the stream is open, this transitions to HalfClosedLocal.
                     if let Some(ss) = self.state.streams.get_mut(&frame.stream_id) {
                         match ss {
-                            StreamState::Open(_) => {
-                                // transition through StreamState::HalfClosedRemote
-                                // so we don't have to remove/re-insert.
-                                let mut entry = StreamState::HalfClosedRemote;
-                                std::mem::swap(&mut entry, ss);
-
-                                let body_tx = match entry {
-                                    StreamState::Open(body_tx) => body_tx,
+                            StreamState::Open { .. } => {
+                                let incoming = match std::mem::take(ss) {
+                                    StreamState::Open { incoming, .. } => incoming,
                                     _ => unreachable!(),
                                 };
-
-                                *ss = StreamState::HalfClosedLocal(body_tx);
+                                *ss = StreamState::HalfClosedLocal { incoming };
                             }
                             _ => {
                                 // transition to closed
@@ -506,8 +500,9 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                 )?;
 
                 match ss {
-                    StreamState::Open(body_tx) | StreamState::HalfClosedLocal(body_tx) => {
-                        if body_tx
+                    StreamState::Open { incoming, .. }
+                    | StreamState::HalfClosedLocal { incoming } => {
+                        if incoming
                             .send(Ok(PieceOrTrailers::Piece(payload.into())))
                             .await
                             .is_err()
@@ -516,10 +511,12 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                         }
 
                         if flags.contains(DataFlags::EndStream) {
-                            // if we're HalfClosedLocal, this transitions to Closed
-                            // otherwise, it transitions to HalfClosedRemote
-                            if matches!(ss, StreamState::Open(_)) {
-                                *ss = StreamState::HalfClosedRemote;
+                            if let StreamState::Open { .. } = ss {
+                                let outgoing = match std::mem::take(ss) {
+                                    StreamState::Open { outgoing, .. } => outgoing,
+                                    _ => unreachable!(),
+                                };
+                                *ss = StreamState::HalfClosedRemote { outgoing };
                             } else if self.state.streams.remove(&frame.stream_id).is_some() {
                                 debug!(
                                     "Closed stream (read data w/EndStream) {}, now have {} streams",
@@ -529,7 +526,7 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                             }
                         }
                     }
-                    StreamState::HalfClosedRemote => {
+                    StreamState::HalfClosedRemote { .. } => {
                         debug!(
                             stream_id = %frame.stream_id,
                             "Received data for closed stream"
@@ -537,6 +534,7 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                         self.rst(frame.stream_id, H2StreamError::StreamClosed)
                             .await?;
                     }
+                    StreamState::Transition => unreachable!(),
                 }
             }
             FrameType::Headers(flags) => {
@@ -610,7 +608,7 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                             }
                         }
                     }
-                    Some(StreamState::Open(_) | StreamState::HalfClosedLocal(_)) => {
+                    Some(StreamState::Open { .. } | StreamState::HalfClosedLocal { .. }) => {
                         headers_or_trailers = HeadersOrTrailers::Trailers;
                         debug!("Receiving trailers for stream {}", frame.stream_id);
 
@@ -625,11 +623,12 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                                 .await?;
                         }
                     }
-                    Some(StreamState::HalfClosedRemote) => {
+                    Some(StreamState::HalfClosedRemote { .. }) => {
                         return Err(H2ConnectionError::StreamClosed {
                             stream_id: frame.stream_id,
                         });
                     }
+                    Some(StreamState::Transition) => unreachable!(),
                 }
 
                 self.read_headers(
@@ -693,14 +692,16 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                             self.state.streams.len()
                         );
                         match ss {
-                            StreamState::Open(body_tx) | StreamState::HalfClosedLocal(body_tx) => {
-                                _ = body_tx
+                            StreamState::Open { incoming, .. }
+                            | StreamState::HalfClosedLocal { incoming, .. } => {
+                                _ = incoming
                                     .send(Err(H2StreamError::ReceivedRstStream.into()))
                                     .await;
                             }
-                            StreamState::HalfClosedRemote => {
+                            StreamState::HalfClosedRemote { .. } => {
                                 // good
                             }
+                            StreamState::Transition => unreachable!(),
                         }
                     }
                 }
@@ -1065,7 +1066,7 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                     state: ExpectResponseHeaders,
                 };
 
-                let (piece_tx, piece_rx) = mpsc::channel::<H2BodyItem>(1); // TODO: is 1 a sensible value here?
+                let (piece_tx, piece_rx) = mpsc::channel::<StreamIncomingItem>(1); // TODO: is 1 a sensible value here?
 
                 let req_body = H2Body {
                     // FIXME: that's not right. h2 requests can still specify
@@ -1075,12 +1076,18 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                     rx: piece_rx,
                 };
 
+                let incoming = piece_tx;
+                let outgoing: StreamOutgoing = Default::default();
+
                 self.state.streams.insert(
                     stream_id,
                     if end_stream {
-                        StreamState::HalfClosedRemote
+                        StreamState::HalfClosedRemote { outgoing }
                     } else {
-                        StreamState::Open(piece_tx)
+                        StreamState::Open {
+                            incoming,
+                            outgoing: Default::default(),
+                        }
                     },
                 );
                 debug!(
@@ -1108,8 +1115,8 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
             }
             HeadersOrTrailers::Trailers => {
                 match self.state.streams.get_mut(&stream_id) {
-                    Some(StreamState::Open(body_tx)) => {
-                        if body_tx
+                    Some(StreamState::Open { incoming, .. }) => {
+                        if incoming
                             .send(Ok(PieceOrTrailers::Trailers(Box::new(headers))))
                             .await
                             .is_err()

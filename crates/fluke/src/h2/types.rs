@@ -5,7 +5,7 @@ use fluke_buffet::Piece;
 use crate::Response;
 
 use super::{
-    body::H2BodySender,
+    body::StreamIncoming,
     parse::{FrameType, KnownErrorCode, Settings, StreamId},
 };
 
@@ -67,17 +67,39 @@ impl Default for ConnState {
 //  R:  RST_STREAM frame
 //  PP:  PUSH_PROMISE frame (with implied CONTINUATION frames); state
 //     transitions are for the promised stream
+#[derive(Default)]
 pub(crate) enum StreamState {
     // we have received full HEADERS
-    Open(H2BodySender),
+    Open {
+        incoming: StreamIncoming,
+        outgoing: StreamOutgoing,
+    },
 
-    // the peer has sent END_STREAM/RST_STREAM
-    HalfClosedRemote,
+    // the peer has sent END_STREAM/RST_STREAM (but we might still send data to the peer)
+    HalfClosedRemote {
+        outgoing: StreamOutgoing,
+    },
 
-    // we have sent END_STREAM/RST_STREAM
-    HalfClosedLocal(H2BodySender),
+    // we have sent END_STREAM/RST_STREAM (but we might still receive data from the peer)
+    HalfClosedLocal {
+        incoming: StreamIncoming,
+    },
+
+    // A transition state used for state machine code
+    #[default]
+    Transition,
+    //
     //
     // Note: the "Closed" state is indicated by not having an entry in the map
+}
+
+#[derive(Default)]
+pub(crate) struct StreamOutgoing {
+    // list of pieces we need to send out
+    pieces: Vec<Piece>,
+
+    // offset within the first piece
+    offset: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
