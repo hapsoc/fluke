@@ -60,6 +60,7 @@ impl ConnState {
             pieces: Vec::new(),
             offset: 0,
             capacity: self.self_settings.initial_window_size,
+            eof: false,
         }
     }
 }
