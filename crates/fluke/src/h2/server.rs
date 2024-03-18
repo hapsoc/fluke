@@ -70,6 +70,7 @@ pub async fn serve(
 pub(crate) struct ServerContext<D: ServerDriver + 'static, W: WriteOwned> {
     driver: Rc<D>,
     state: ConnState,
+
     hpack_dec: fluke_hpack::Decoder<'static>,
     hpack_enc: fluke_hpack::Encoder<'static>,
     out_scratch: RollMut,
@@ -394,10 +395,30 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                 self.write_frame(frame, payload).await?;
             }
             H2EventPayload::BodyChunk(chunk) => {
-                let flags = BitFlags::<DataFlags>::default();
-                let frame = Frame::new(FrameType::Data(flags), ev.stream_id);
+                let stream = match self.state.streams.get_mut(&ev.stream_id) {
+                    None => {
+                        // ignore the event then, but at this point we should
+                        // tell the sender to stop sending chunks, which is not
+                        // possible if they all share the same ev_tx
+                        // TODO: make it possible to propagate errors to the sender
+                        return Ok(());
+                    }
+                    Some(stream) => stream,
+                };
 
-                self.write_frame(frame, chunk).await?;
+                if let Some(outgoing) = stream.outgoing_mut() {
+                    outgoing.pieces.push(chunk);
+                    self.state.streams_with_pending_data.insert(ev.stream_id);
+                    if self.state.outgoing_capacity > 0 && outgoing.capacity > 0 {
+                        // worth revisiting then!
+                        self.state.send_data_maybe.notify_one();
+                    }
+                }
+
+                // let flags = BitFlags::<DataFlags>::default();
+                // let frame = Frame::new(FrameType::Data(flags), ev.stream_id);
+
+                // self.write_frame(frame, chunk).await?;
             }
             H2EventPayload::BodyEnd => {
                 // FIXME: this should transition the stream to `Closed`
@@ -1077,7 +1098,7 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                 };
 
                 let incoming = piece_tx;
-                let outgoing: StreamOutgoing = Default::default();
+                let outgoing: StreamOutgoing = self.state.mk_stream_outgoing();
 
                 self.state.streams.insert(
                     stream_id,
@@ -1086,7 +1107,7 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                     } else {
                         StreamState::Open {
                             incoming,
-                            outgoing: Default::default(),
+                            outgoing: self.state.mk_stream_outgoing(),
                         }
                     },
                 );
@@ -1095,6 +1116,12 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                     self.state.streams.len()
                 );
 
+                // FIXME: don't spawn, just add to an unordered futures
+                // instead and poll it in our main loop, to do intra-task
+                // concurrency.
+                //
+                // this lets us freeze the entire http2 server and explore
+                // its entire state.
                 fluke_maybe_uring::spawn({
                     let driver = self.driver.clone();
                     async move {

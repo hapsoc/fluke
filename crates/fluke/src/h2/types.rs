@@ -1,6 +1,10 @@
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use fluke_buffet::Piece;
+use tokio::sync::Notify;
 
 use crate::Response;
 
@@ -12,17 +16,50 @@ use super::{
 pub(crate) struct ConnState {
     pub(crate) streams: HashMap<StreamId, StreamState>,
     pub(crate) last_stream_id: StreamId,
+
     pub(crate) self_settings: Settings,
     pub(crate) peer_settings: Settings,
+
+    /// notified when we have data to send, like when:
+    /// - an H2Body has been written to, AND
+    /// - the corresponding stream has available capacity
+    /// - the connection has available capacity
+    pub(crate) send_data_maybe: Notify,
+    pub(crate) streams_with_pending_data: HashSet<StreamId>,
+
+    pub(crate) incoming_capacity: u32,
+    pub(crate) outgoing_capacity: u32,
 }
 
 impl Default for ConnState {
     fn default() -> Self {
-        Self {
+        let mut s = Self {
             streams: Default::default(),
             last_stream_id: StreamId(0),
+
             self_settings: Default::default(),
             peer_settings: Default::default(),
+
+            send_data_maybe: Default::default(),
+            streams_with_pending_data: Default::default(),
+
+            incoming_capacity: 0,
+            outgoing_capacity: 0,
+        };
+        s.incoming_capacity = s.self_settings.initial_window_size;
+        s.outgoing_capacity = s.peer_settings.initial_window_size;
+
+        s
+    }
+}
+
+impl ConnState {
+    /// create a new [StreamOutgoing] based on our current settings
+    pub(crate) fn mk_stream_outgoing(&self) -> StreamOutgoing {
+        StreamOutgoing {
+            pieces: Vec::new(),
+            offset: 0,
+            capacity: self.self_settings.initial_window_size,
         }
     }
 }
@@ -93,13 +130,54 @@ pub(crate) enum StreamState {
     // Note: the "Closed" state is indicated by not having an entry in the map
 }
 
-#[derive(Default)]
+impl StreamState {
+    /// Get the inner `StreamIncoming` if the state is `Open` or `HalfClosedLocal`.
+    pub(crate) fn incoming_ref(&self) -> Option<&StreamIncoming> {
+        match self {
+            StreamState::Open { incoming, .. } => Some(incoming),
+            StreamState::HalfClosedLocal { incoming, .. } => Some(incoming),
+            _ => None,
+        }
+    }
+
+    /// Get the inner `StreamIncoming` if the state is `Open` or `HalfClosedLocal`.
+    pub(crate) fn incoming_mut(&mut self) -> Option<&mut StreamIncoming> {
+        match self {
+            StreamState::Open { incoming, .. } => Some(incoming),
+            StreamState::HalfClosedLocal { incoming, .. } => Some(incoming),
+            _ => None,
+        }
+    }
+
+    /// Get the inner `StreamOutgoing` if the state is `Open` or `HalfClosedRemote`.
+    pub(crate) fn outgoing_ref(&self) -> Option<&StreamOutgoing> {
+        match self {
+            StreamState::Open { outgoing, .. } => Some(outgoing),
+            StreamState::HalfClosedRemote { outgoing, .. } => Some(outgoing),
+            _ => None,
+        }
+    }
+
+    /// Get the inner `StreamOutgoing` if the state is `Open` or `HalfClosedRemote`.
+    pub(crate) fn outgoing_mut(&mut self) -> Option<&mut StreamOutgoing> {
+        match self {
+            StreamState::Open { outgoing, .. } => Some(outgoing),
+            StreamState::HalfClosedRemote { outgoing, .. } => Some(outgoing),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) struct StreamOutgoing {
     // list of pieces we need to send out
-    pieces: Vec<Piece>,
+    pub(crate) pieces: Vec<Piece>,
 
     // offset within the first piece
-    offset: usize,
+    pub(crate) offset: usize,
+
+    // window size of the stream, ie. how many bytes
+    // we can send to the receiver before waiting.
+    pub(crate) capacity: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
