@@ -59,7 +59,7 @@ impl ConnState {
         StreamOutgoing {
             pieces: Vec::new(),
             offset: 0,
-            capacity: self.self_settings.initial_window_size,
+            capacity: self.peer_settings.initial_window_size,
             eof: false,
         }
     }

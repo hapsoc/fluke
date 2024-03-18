@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::HashSet,
     io::Write,
     net::Shutdown,
     rc::Rc,
@@ -84,6 +85,28 @@ pub(crate) struct ServerContext<D: ServerDriver + 'static, W: WriteOwned> {
 
     ev_tx: mpsc::Sender<H2Event>,
     ev_rx: mpsc::Receiver<H2Event>,
+}
+
+impl ConnState {
+    fn eof_streams(&self) -> HashSet<StreamId> {
+        self.streams_with_pending_data
+            .iter()
+            .copied()
+            .filter_map(|id| {
+                self.streams
+                    .get(&id)
+                    .and_then(|ss| ss.outgoing_ref())
+                    .map(|og| (id, og))
+            })
+            .filter_map(|(id, outgoing)| {
+                if outgoing.eof && outgoing.is_empty() {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
@@ -353,6 +376,10 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                     }
                 }
 
+                _ = self.state.send_data_maybe.notified() => {
+                    self.send_data_maybe().await?;
+                }
+
                 ev = self.ev_rx.recv() => {
                     match ev {
                         Some(ev) => self.handle_event(ev).await?,
@@ -360,6 +387,61 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                     }
                 },
             }
+        }
+
+        Ok(())
+    }
+
+    async fn send_data_maybe(&mut self) -> Result<(), H2ConnectionError> {
+        let eof_streams: HashSet<StreamId> = self.state.eof_streams();
+        for id in eof_streams {
+            let flags = DataFlags::EndStream;
+            let frame = Frame::new(FrameType::Data(flags.into()), id);
+            self.write_frame(frame, Roll::empty()).await?;
+        }
+
+        if self.state.outgoing_capacity == 0 {
+            // that's all we can do
+            return Ok(());
+        }
+
+        let mut not_pending: HashSet<StreamId> = Default::default();
+
+        for id in self.state.streams_with_pending_data.iter().copied() {
+            let outgoing = self
+                .state
+                .streams
+                .get_mut(&id)
+                .and_then(|ss| ss.outgoing_mut())
+                .expect("stream should not be in streams_with_pending_data if it's already closed / not in an outgoing state");
+
+            if outgoing.is_empty() {
+                not_pending.insert(id);
+                continue;
+            }
+
+            // how much data do we have available?
+            let outg_len: u32 = outgoing
+                .pieces
+                .iter()
+                .map(|p| p.len())
+                .sum::<usize>()
+                .try_into()
+                .unwrap_or(u32::MAX);
+
+            // how much data are we allowed to write?
+            let conn_cap = self.state.outgoing_capacity;
+            let strm_cap = outgoing.capacity;
+            let max_fram = self.state.peer_settings.max_frame_size;
+
+            let write_size = conn_cap.min(strm_cap).min(max_fram).min(outg_len);
+
+            debug!(%outg_len, %conn_cap, %strm_cap, %max_fram, %write_size, "ready to write");
+            todo!();
+        }
+
+        for id in not_pending {
+            self.state.streams_with_pending_data.remove(&id);
         }
 
         Ok(())
@@ -457,29 +539,37 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
         let payload = payload.into();
 
         match &frame.frame_type {
-            FrameType::Data(headers) => {
-                if headers.contains(DataFlags::EndStream) {
-                    // if the stream is open, this transitions to HalfClosedLocal.
-                    if let Some(ss) = self.state.streams.get_mut(&frame.stream_id) {
-                        match ss {
+            FrameType::Data(flags) => {
+                if flags.contains(DataFlags::EndStream) {
+                    // we won't be sending any more data on this stream
+                    self.state
+                        .streams_with_pending_data
+                        .remove(&frame.stream_id);
+
+                    if let std::collections::hash_map::Entry::Occupied(mut ss) =
+                        self.state.streams.entry(frame.stream_id)
+                    {
+                        match ss.get_mut() {
                             StreamState::Open { .. } => {
-                                let incoming = match std::mem::take(ss) {
+                                let incoming = match std::mem::take(ss.get_mut()) {
                                     StreamState::Open { incoming, .. } => incoming,
                                     _ => unreachable!(),
                                 };
-                                *ss = StreamState::HalfClosedLocal { incoming };
+                                // this avoid having to re-insert the stream in the map
+                                *ss.get_mut() = StreamState::HalfClosedLocal { incoming };
                             }
                             _ => {
                                 // transition to closed
-                                if self.state.streams.remove(&frame.stream_id).is_some() {
-                                    debug!(
-                                        "Closed stream {} (wrote data w/EndStream), now have {} streams",
-                                        frame.stream_id,
-                                        self.state.streams.len()
-                                    );
-                                }
+                                ss.remove();
+                                debug!(
+                                    "Closed stream {} (wrote data w/EndStream), now have {} streams",
+                                    frame.stream_id,
+                                    self.state.streams.len()
+                                );
                             }
                         }
+                    } else {
+                        unreachable!("stream was in streams_with_pending_data but not in streams")
                     }
                 }
             }
@@ -1146,7 +1236,7 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
 
                 let incoming = StreamIncoming {
                     // FIXME: handle negative window size, cf. https://httpwg.org/specs/rfc9113.html#InitialWindowSize
-                    capacity: self.state.peer_settings.initial_window_size,
+                    capacity: self.state.self_settings.initial_window_size,
                     tx: piece_tx,
                 };
                 let outgoing: StreamOutgoing = self.state.mk_stream_outgoing();

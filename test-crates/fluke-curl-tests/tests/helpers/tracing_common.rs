@@ -12,7 +12,7 @@ pub(crate) fn setup_tracing() {
         .with_target("want", Level::INFO);
 
     let fmt_layer = tracing_subscriber::fmt::layer()
-        .pretty()
+        .with_ansi(true)
         .with_file(false)
         .with_line_number(false);
 
