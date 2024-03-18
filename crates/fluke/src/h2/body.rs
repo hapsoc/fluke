@@ -8,7 +8,14 @@ pub(crate) enum PieceOrTrailers {
     Trailers(Box<Headers>),
 }
 
-pub(crate) type StreamIncoming = mpsc::Sender<StreamIncomingItem>;
+pub(crate) struct StreamIncoming {
+    // TODO: don't allow access to tx, check against capacity first?
+    pub(crate) tx: mpsc::Sender<StreamIncomingItem>,
+
+    // incoming capacity (that we decide, we get to tell
+    // the peer how much we can handle with window updates)
+    pub(crate) capacity: u32,
+}
 
 // FIXME: don't use eyre, do proper error handling
 pub(crate) type StreamIncomingItem = eyre::Result<PieceOrTrailers>;

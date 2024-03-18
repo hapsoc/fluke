@@ -239,8 +239,8 @@ pub(crate) enum H2ConnectionError {
     #[error("client sent a push promise frame, clients aren't allowed to do that, cf. RFC9113 section 8.4")]
     ClientSentPushPromise,
 
-    #[error("received window update for unknown stream {stream_id}")]
-    WindowUpdateForUnknownStream { stream_id: StreamId },
+    #[error("received window update for unknown/closed stream {stream_id}")]
+    WindowUpdateForUnknownOrClosedStream { stream_id: StreamId },
 
     #[error("other error: {0:?}")]
     Internal(#[from] eyre::Report),
@@ -275,6 +275,9 @@ pub(crate) enum H2ConnectionError {
     #[error("zero increment in window update frame for stream")]
     WindowUpdateZeroIncrement,
 
+    #[error("received window update that made the window size overflow")]
+    WindowUpdateOverflow,
+
     #[error("received window update frame with invalid length {len}")]
     WindowUpdateInvalidLength { len: usize },
 }
@@ -289,6 +292,8 @@ impl H2ConnectionError {
             H2ConnectionError::PingFrameInvalidLength { .. } => KnownErrorCode::FrameSizeError,
             H2ConnectionError::SettingsAckWithPayload { .. } => KnownErrorCode::FrameSizeError,
             H2ConnectionError::WindowUpdateInvalidLength { .. } => KnownErrorCode::FrameSizeError,
+            // flow control errors
+            H2ConnectionError::WindowUpdateOverflow => KnownErrorCode::FlowControlError,
             // compression errors
             H2ConnectionError::CompressionError(_) => KnownErrorCode::CompressionError,
             // stream closed error
@@ -327,6 +332,9 @@ pub(crate) enum H2StreamError {
 
     #[error("received RST_STREAM frame with invalid size, expected 4 got {frame_size}")]
     InvalidRstStreamFrameSize { frame_size: u32 },
+
+    #[error("received WINDOW_UPDATE that made the window size overflow")]
+    WindowUpdateOverflow,
 }
 
 impl H2StreamError {
@@ -335,10 +343,15 @@ impl H2StreamError {
         use KnownErrorCode as Code;
 
         match self {
+            // stream closed error
             StreamClosed => Code::StreamClosed,
+            // stream refused error
             RefusedStream => Code::RefusedStream,
+            // frame size errors
             InvalidPriorityFrameSize { .. } => Code::FrameSizeError,
             InvalidRstStreamFrameSize { .. } => Code::FrameSizeError,
+            // flow control errors
+            WindowUpdateOverflow => Code::FlowControlError,
             _ => Code::ProtocolError,
         }
     }

@@ -23,7 +23,7 @@ use tracing::{debug, trace};
 
 use crate::{
     h2::{
-        body::{H2Body, PieceOrTrailers, StreamIncomingItem},
+        body::{H2Body, PieceOrTrailers, StreamIncoming, StreamIncomingItem},
         encode::{EncoderState, H2Encoder},
         parse::{
             self, parse_reserved_and_u31, ContinuationFlags, DataFlags, Frame, FrameType,
@@ -524,6 +524,7 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                     StreamState::Open { incoming, .. }
                     | StreamState::HalfClosedLocal { incoming } => {
                         if incoming
+                            .tx
                             .send(Ok(PieceOrTrailers::Piece(payload.into())))
                             .await
                             .is_err()
@@ -716,6 +717,7 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                             StreamState::Open { incoming, .. }
                             | StreamState::HalfClosedLocal { incoming, .. } => {
                                 _ = incoming
+                                    .tx
                                     .send(Err(H2StreamError::ReceivedRstStream.into()))
                                     .await;
                             }
@@ -820,17 +822,49 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                 }
 
                 if frame.stream_id == StreamId::CONNECTION {
-                    debug!("TODO: ignoring connection-wide window update");
-                } else {
-                    match self.state.streams.get_mut(&frame.stream_id) {
+                    let new_capacity = match self.state.outgoing_capacity.checked_add(increment) {
+                        Some(x) => x,
                         None => {
-                            return Err(H2ConnectionError::WindowUpdateForUnknownStream {
+                            return Err(H2ConnectionError::WindowUpdateOverflow);
+                        }
+                    };
+                    debug!(old_capacity = %self.state.outgoing_capacity, %new_capacity, "connection window update");
+                    self.state.outgoing_capacity = new_capacity;
+                    self.state.send_data_maybe.notify_one();
+                } else {
+                    let outgoing = match self
+                        .state
+                        .streams
+                        .get_mut(&frame.stream_id)
+                        .and_then(|ss| ss.outgoing_mut())
+                    {
+                        Some(ss) => ss,
+                        None => {
+                            return Err(H2ConnectionError::WindowUpdateForUnknownOrClosedStream {
                                 stream_id: frame.stream_id,
                             });
                         }
-                        Some(_ss) => {
-                            debug!("TODO: handle window update for stream {}", frame.stream_id)
+                    };
+
+                    let new_capacity = match outgoing.capacity.checked_add(increment) {
+                        Some(x) => x,
+                        None => {
+                            // reset the stream
+                            self.rst(frame.stream_id, H2StreamError::WindowUpdateOverflow)
+                                .await?;
+                            return Ok(());
                         }
+                    };
+
+                    debug!(old_capacity = %outgoing.capacity, %new_capacity, "stream window update");
+                    outgoing.capacity = new_capacity;
+                    if self.state.outgoing_capacity > 0
+                        && self
+                            .state
+                            .streams_with_pending_data
+                            .contains(&frame.stream_id)
+                    {
+                        self.state.send_data_maybe.notify_one();
                     }
                 }
             }
@@ -1097,7 +1131,11 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                     rx: piece_rx,
                 };
 
-                let incoming = piece_tx;
+                let incoming = StreamIncoming {
+                    // FIXME: handle negative window size, cf. https://httpwg.org/specs/rfc9113.html#InitialWindowSize
+                    capacity: self.state.peer_settings.initial_window_size,
+                    tx: piece_tx,
+                };
                 let outgoing: StreamOutgoing = self.state.mk_stream_outgoing();
 
                 self.state.streams.insert(
@@ -1144,6 +1182,7 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                 match self.state.streams.get_mut(&stream_id) {
                     Some(StreamState::Open { incoming, .. }) => {
                         if incoming
+                            .tx
                             .send(Ok(PieceOrTrailers::Trailers(Box::new(headers))))
                             .await
                             .is_err()
