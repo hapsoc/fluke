@@ -20,12 +20,12 @@ test *args:
 	just build-testbed
 	RUST_BACKTRACE=1 cargo nextest run {{args}}
 
-curl-tests:
-	RUST_BACKTRACE=1 cargo nextest run --manifest-path test-crates/fluke-curl-tests/Cargo.toml
+curl-tests *args:
+	RUST_BACKTRACE=1 cargo nextest run --manifest-path test-crates/fluke-curl-tests/Cargo.toml {{args}}
 
 build-testbed:
 	cargo build --release --manifest-path test-crates/hyper-testbed/Cargo.toml
-	
+
 single-test *args:
 	just test --no-capture {{args}}
 
@@ -33,7 +33,7 @@ bench *args:
 	RUST_BACKTRACE=1 cargo bench {{args}} -- --plotting-backend plotters
 
 h2spec *args:
-	#!/bin/bash -eux	
+	#!/bin/bash -eux
 	export RUST_LOG="${RUST_LOG:-fluke=debug,fluke_hpack=info}"
 	export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 	cargo run --manifest-path test-crates/fluke-h2spec/Cargo.toml -- {{args}}
@@ -57,4 +57,3 @@ check:
 
 ktls-sample:
 	cargo run --manifest-path test-crates/fluke-tls-sample/Cargo.toml
-
