@@ -395,7 +395,12 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                 self.write_frame(frame, payload).await?;
             }
             H2EventPayload::BodyChunk(chunk) => {
-                let stream = match self.state.streams.get_mut(&ev.stream_id) {
+                let outgoing = match self
+                    .state
+                    .streams
+                    .get_mut(&ev.stream_id)
+                    .and_then(|s| s.outgoing_mut())
+                {
                     None => {
                         // ignore the event then, but at this point we should
                         // tell the sender to stop sending chunks, which is not
@@ -403,32 +408,40 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                         // TODO: make it possible to propagate errors to the sender
                         return Ok(());
                     }
-                    Some(stream) => stream,
+                    Some(outgoing) => outgoing,
                 };
 
-                if let Some(outgoing) = stream.outgoing_mut() {
-                    outgoing.pieces.push(chunk);
-                    self.state.streams_with_pending_data.insert(ev.stream_id);
-                    if self.state.outgoing_capacity > 0 && outgoing.capacity > 0 {
-                        // worth revisiting then!
-                        self.state.send_data_maybe.notify_one();
-                    }
+                if outgoing.eof {
+                    unreachable!("got a body chunk after the body end event!")
                 }
 
-                // let flags = BitFlags::<DataFlags>::default();
-                // let frame = Frame::new(FrameType::Data(flags), ev.stream_id);
-
-                // self.write_frame(frame, chunk).await?;
+                outgoing.pieces.push(chunk);
+                self.state.streams_with_pending_data.insert(ev.stream_id);
+                if self.state.outgoing_capacity > 0 && outgoing.capacity > 0 {
+                    // worth revisiting then!
+                    self.state.send_data_maybe.notify_one();
+                }
             }
             H2EventPayload::BodyEnd => {
-                // FIXME: this should transition the stream to `Closed`
-                // state (or at the very least `HalfClosedLocal`).
-                // Either way, whoever owns the stream state should know
-                // about it, cf. https://github.com/bearcove/fluke/issues/123
+                let outgoing = match self
+                    .state
+                    .streams
+                    .get_mut(&ev.stream_id)
+                    .and_then(|s| s.outgoing_mut())
+                {
+                    None => return Ok(()),
+                    Some(outgoing) => outgoing,
+                };
 
-                let flags = DataFlags::EndStream;
-                let frame = Frame::new(FrameType::Data(flags.into()), ev.stream_id);
-                self.write_frame(frame, Roll::empty()).await?;
+                if outgoing.eof {
+                    panic!("got a body end event after the body end event!")
+                }
+
+                outgoing.eof = true;
+                if outgoing.is_empty() {
+                    // we'll need to send a zero-length data frame
+                    self.state.send_data_maybe.notify_one();
+                }
             }
         }
 

@@ -178,6 +178,16 @@ pub(crate) struct StreamOutgoing {
     // window size of the stream, ie. how many bytes
     // we can send to the receiver before waiting.
     pub(crate) capacity: u32,
+
+    // true if the stream has been closed (ie. all the pieces
+    // have been sent and the receiver has been notified)
+    pub(crate) eof: bool,
+}
+
+impl StreamOutgoing {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
