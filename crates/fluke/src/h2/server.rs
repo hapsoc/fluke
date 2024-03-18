@@ -376,16 +376,16 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                     }
                 }
 
-                _ = self.state.send_data_maybe.notified() => {
-                    self.send_data_maybe().await?;
-                }
-
                 ev = self.ev_rx.recv() => {
                     match ev {
                         Some(ev) => self.handle_event(ev).await?,
                         None => unreachable!("the context owns a copy of the sender, and this method has &mut self, so the sender can't be dropped while this method is running"),
                     }
-                },
+                }
+
+                _ = self.state.send_data_maybe.notified() => {
+                    self.send_data_maybe().await?;
+                }
             }
         }
 
@@ -407,7 +407,14 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
 
         let mut not_pending: HashSet<StreamId> = Default::default();
 
-        for id in self.state.streams_with_pending_data.iter().copied() {
+        let streams_with_pending_data: HashSet<_> = self
+            .state
+            .streams_with_pending_data
+            .iter()
+            .copied()
+            .collect();
+
+        for id in streams_with_pending_data {
             let outgoing = self
                 .state
                 .streams
@@ -437,7 +444,27 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
             let write_size = conn_cap.min(strm_cap).min(max_fram).min(outg_len);
 
             debug!(%outg_len, %conn_cap, %strm_cap, %max_fram, %write_size, "ready to write");
-            todo!();
+            if outg_len == write_size {
+                // yay we can just send everything
+                // TODO: send a PieceList and do a single write instead
+                // TODO: actually respect max frame size
+
+                let mut pieces = std::mem::take(&mut outgoing.pieces);
+                let eof = outgoing.eof;
+                let num_pieces = pieces.len();
+
+                for (i, piece) in pieces.drain(..).enumerate() {
+                    let flags: BitFlags<DataFlags> = if eof && i == num_pieces - 1 {
+                        DataFlags::EndStream.into()
+                    } else {
+                        Default::default()
+                    };
+                    let frame = Frame::new(FrameType::Data(flags.into()), id);
+                    self.write_frame(frame, piece).await?;
+                }
+            } else {
+                todo!("handle partial writes")
+            }
         }
 
         for id in not_pending {
@@ -497,7 +524,11 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                     unreachable!("got a body chunk after the body end event!")
                 }
 
-                outgoing.pieces.push(chunk);
+                // FIXME: this isn't great, because, due to biased polling, body pieces can pile up.
+                // when we've collected enough pieces for max frame size, we should really send them.
+                outgoing.pieces.push_back(chunk);
+                debug!(stream_id = %ev.stream_id, pending_chunks = %outgoing.pieces.len(), "got a body chunk");
+
                 self.state.streams_with_pending_data.insert(ev.stream_id);
                 if self.state.outgoing_capacity > 0 && outgoing.capacity > 0 {
                     // worth revisiting then!
@@ -519,6 +550,7 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                     panic!("got a body end event after the body end event!")
                 }
 
+                debug!(stream_id = %ev.stream_id, pending_chunks = %outgoing.pieces.len(), "got body end");
                 outgoing.eof = true;
                 if outgoing.is_empty() {
                     // we'll need to send a zero-length data frame
@@ -535,41 +567,69 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
         mut frame: Frame,
         payload: impl Into<Piece>,
     ) -> Result<(), H2ConnectionError> {
-        debug!(?frame, ">");
         let payload = payload.into();
 
         match &frame.frame_type {
             FrameType::Data(flags) => {
+                let mut ss = match self.state.streams.entry(frame.stream_id) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry,
+                    std::collections::hash_map::Entry::Vacant(_) => unreachable!(
+                        "writing DATA frame for non-existent stream, this should never happen"
+                    ),
+                };
+
+                // update stream flow control window
+                {
+                    let outgoing = match ss.get_mut().outgoing_mut() {
+                        Some(og) => og,
+                        None => unreachable!("writing DATA frame for stream in the wrong state"),
+                    };
+                    let payload_len: u32 = payload.len().try_into().unwrap();
+                    if let Some(next_cap) = outgoing.capacity.checked_sub(payload_len) {
+                        outgoing.capacity = next_cap;
+                    } else {
+                        unreachable!(
+                            "should never write a frame that makes the stream capacity negative"
+                        )
+                    }
+                }
+
+                // now update connection flow control window
+                {
+                    let payload_len: u32 = payload.len().try_into().unwrap();
+                    if let Some(next_cap) = self.state.outgoing_capacity.checked_sub(payload_len) {
+                        self.state.outgoing_capacity = next_cap;
+                    } else {
+                        unreachable!(
+                            "should never write a frame that makes the connection capacity negative"
+                        )
+                    }
+                }
+
                 if flags.contains(DataFlags::EndStream) {
                     // we won't be sending any more data on this stream
                     self.state
                         .streams_with_pending_data
                         .remove(&frame.stream_id);
 
-                    if let std::collections::hash_map::Entry::Occupied(mut ss) =
-                        self.state.streams.entry(frame.stream_id)
-                    {
-                        match ss.get_mut() {
-                            StreamState::Open { .. } => {
-                                let incoming = match std::mem::take(ss.get_mut()) {
-                                    StreamState::Open { incoming, .. } => incoming,
-                                    _ => unreachable!(),
-                                };
-                                // this avoid having to re-insert the stream in the map
-                                *ss.get_mut() = StreamState::HalfClosedLocal { incoming };
-                            }
-                            _ => {
-                                // transition to closed
-                                ss.remove();
-                                debug!(
-                                    "Closed stream {} (wrote data w/EndStream), now have {} streams",
-                                    frame.stream_id,
-                                    self.state.streams.len()
-                                );
-                            }
+                    match ss.get_mut() {
+                        StreamState::Open { .. } => {
+                            let incoming = match std::mem::take(ss.get_mut()) {
+                                StreamState::Open { incoming, .. } => incoming,
+                                _ => unreachable!(),
+                            };
+                            // this avoid having to re-insert the stream in the map
+                            *ss.get_mut() = StreamState::HalfClosedLocal { incoming };
                         }
-                    } else {
-                        unreachable!("stream was in streams_with_pending_data but not in streams")
+                        _ => {
+                            // transition to closed
+                            ss.remove();
+                            debug!(
+                                "Closed stream {} (wrote data w/EndStream), now have {} streams",
+                                frame.stream_id,
+                                self.state.streams.len()
+                            );
+                        }
                     }
                 }
             }
@@ -590,6 +650,7 @@ impl<D: ServerDriver + 'static, W: WriteOwned> ServerContext<D, W> {
                 frame_size: payload.len() as _,
                 max_frame_size: u32::MAX,
             })?;
+        debug!(?frame, ">");
         let frame_roll = frame.into_roll(&mut self.out_scratch)?;
 
         if payload.is_empty() {

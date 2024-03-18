@@ -138,6 +138,7 @@ impl Piece {
 /// A list of [Piece], suitable for issuing vectored writes via io_uring.
 #[derive(Default)]
 pub struct PieceList {
+    // TODO: use smallvec?
     pieces: Vec<Piece>,
 }
 

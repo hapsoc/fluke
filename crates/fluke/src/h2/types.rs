@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
 };
 
@@ -57,8 +57,7 @@ impl ConnState {
     /// create a new [StreamOutgoing] based on our current settings
     pub(crate) fn mk_stream_outgoing(&self) -> StreamOutgoing {
         StreamOutgoing {
-            pieces: Vec::new(),
-            offset: 0,
+            pieces: Default::default(),
             capacity: self.peer_settings.initial_window_size,
             eof: false,
         }
@@ -171,10 +170,7 @@ impl StreamState {
 
 pub(crate) struct StreamOutgoing {
     // list of pieces we need to send out
-    pub(crate) pieces: Vec<Piece>,
-
-    // offset within the first piece
-    pub(crate) offset: usize,
+    pub(crate) pieces: VecDeque<Piece>,
 
     // window size of the stream, ie. how many bytes
     // we can send to the receiver before waiting.
