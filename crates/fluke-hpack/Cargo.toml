@@ -1,6 +1,6 @@
 [package]
 name = "fluke-hpack"
-version = "0.3.0"
+version = "0.3.1"
 authors = [
     "Marko Lalic <marko.lalic@gmail.com>",
     "Amos Wenger <amos@bearcove.net>",
