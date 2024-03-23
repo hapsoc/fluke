@@ -311,9 +311,7 @@ impl Frame {
         self
     }
 
-    /// Parse a frame from the given slice. This also takes the payload from the
-    /// slice, and copies it to the heap, which may not be ideal for a production
-    /// implementation.
+    /// Parse a frame from the given slice
     pub fn parse(i: Roll) -> IResult<Roll, Self> {
         let (i, (len, frame_type, (reserved, stream_id))) = tuple((
             be_u24,
@@ -607,7 +605,6 @@ impl Settings {
                     }
                     SettingIdentifier::MaxConcurrentStreams => {
                         settings.max_concurrent_streams = value;
-                        tracing::warn!("parsed max concurrent streams {value}");
                     }
                     SettingIdentifier::InitialWindowSize => {
                         if value > Self::MAX_INITIAL_WINDOW_SIZE {

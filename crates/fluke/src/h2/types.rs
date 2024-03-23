@@ -1,28 +1,65 @@
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    fmt,
+};
 
 use fluke_buffet::Piece;
+use tokio::sync::Notify;
 
 use crate::Response;
 
 use super::{
-    body::H2BodySender,
+    body::StreamIncoming,
     parse::{FrameType, KnownErrorCode, Settings, StreamId},
 };
 
 pub(crate) struct ConnState {
     pub(crate) streams: HashMap<StreamId, StreamState>,
     pub(crate) last_stream_id: StreamId,
+
     pub(crate) self_settings: Settings,
     pub(crate) peer_settings: Settings,
+
+    /// notified when we have data to send, like when:
+    /// - an H2Body has been written to, AND
+    /// - the corresponding stream has available capacity
+    /// - the connection has available capacity
+    pub(crate) send_data_maybe: Notify,
+    pub(crate) streams_with_pending_data: HashSet<StreamId>,
+
+    pub(crate) incoming_capacity: u32,
+    pub(crate) outgoing_capacity: u32,
 }
 
 impl Default for ConnState {
     fn default() -> Self {
-        Self {
+        let mut s = Self {
             streams: Default::default(),
             last_stream_id: StreamId(0),
+
             self_settings: Default::default(),
             peer_settings: Default::default(),
+
+            send_data_maybe: Default::default(),
+            streams_with_pending_data: Default::default(),
+
+            incoming_capacity: 0,
+            outgoing_capacity: 0,
+        };
+        s.incoming_capacity = s.self_settings.initial_window_size;
+        s.outgoing_capacity = s.peer_settings.initial_window_size;
+
+        s
+    }
+}
+
+impl ConnState {
+    /// create a new [StreamOutgoing] based on our current settings
+    pub(crate) fn mk_stream_outgoing(&self) -> StreamOutgoing {
+        StreamOutgoing {
+            pieces: Default::default(),
+            capacity: self.peer_settings.initial_window_size,
+            eof: false,
         }
     }
 }
@@ -67,17 +104,87 @@ impl Default for ConnState {
 //  R:  RST_STREAM frame
 //  PP:  PUSH_PROMISE frame (with implied CONTINUATION frames); state
 //     transitions are for the promised stream
+#[derive(Default)]
 pub(crate) enum StreamState {
     // we have received full HEADERS
-    Open(H2BodySender),
+    Open {
+        incoming: StreamIncoming,
+        outgoing: StreamOutgoing,
+    },
 
-    // the peer has sent END_STREAM/RST_STREAM
-    HalfClosedRemote,
+    // the peer has sent END_STREAM/RST_STREAM (but we might still send data to the peer)
+    HalfClosedRemote {
+        outgoing: StreamOutgoing,
+    },
 
-    // we have sent END_STREAM/RST_STREAM
-    HalfClosedLocal(H2BodySender),
+    // we have sent END_STREAM/RST_STREAM (but we might still receive data from the peer)
+    HalfClosedLocal {
+        incoming: StreamIncoming,
+    },
+
+    // A transition state used for state machine code
+    #[default]
+    Transition,
+    //
     //
     // Note: the "Closed" state is indicated by not having an entry in the map
+}
+
+impl StreamState {
+    /// Get the inner `StreamIncoming` if the state is `Open` or `HalfClosedLocal`.
+    pub(crate) fn incoming_ref(&self) -> Option<&StreamIncoming> {
+        match self {
+            StreamState::Open { incoming, .. } => Some(incoming),
+            StreamState::HalfClosedLocal { incoming, .. } => Some(incoming),
+            _ => None,
+        }
+    }
+
+    /// Get the inner `StreamIncoming` if the state is `Open` or `HalfClosedLocal`.
+    pub(crate) fn incoming_mut(&mut self) -> Option<&mut StreamIncoming> {
+        match self {
+            StreamState::Open { incoming, .. } => Some(incoming),
+            StreamState::HalfClosedLocal { incoming, .. } => Some(incoming),
+            _ => None,
+        }
+    }
+
+    /// Get the inner `StreamOutgoing` if the state is `Open` or `HalfClosedRemote`.
+    pub(crate) fn outgoing_ref(&self) -> Option<&StreamOutgoing> {
+        match self {
+            StreamState::Open { outgoing, .. } => Some(outgoing),
+            StreamState::HalfClosedRemote { outgoing, .. } => Some(outgoing),
+            _ => None,
+        }
+    }
+
+    /// Get the inner `StreamOutgoing` if the state is `Open` or `HalfClosedRemote`.
+    pub(crate) fn outgoing_mut(&mut self) -> Option<&mut StreamOutgoing> {
+        match self {
+            StreamState::Open { outgoing, .. } => Some(outgoing),
+            StreamState::HalfClosedRemote { outgoing, .. } => Some(outgoing),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) struct StreamOutgoing {
+    // list of pieces we need to send out
+    pub(crate) pieces: VecDeque<Piece>,
+
+    // window size of the stream, ie. how many bytes
+    // we can send to the receiver before waiting.
+    pub(crate) capacity: u32,
+
+    // true if the stream has been closed (ie. all the pieces
+    // have been sent and the receiver has been notified)
+    pub(crate) eof: bool,
+}
+
+impl StreamOutgoing {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -139,8 +246,8 @@ pub(crate) enum H2ConnectionError {
     #[error("client sent a push promise frame, clients aren't allowed to do that, cf. RFC9113 section 8.4")]
     ClientSentPushPromise,
 
-    #[error("received window update for unknown stream {stream_id}")]
-    WindowUpdateForUnknownStream { stream_id: StreamId },
+    #[error("received window update for unknown/closed stream {stream_id}")]
+    WindowUpdateForUnknownOrClosedStream { stream_id: StreamId },
 
     #[error("other error: {0:?}")]
     Internal(#[from] eyre::Report),
@@ -175,6 +282,9 @@ pub(crate) enum H2ConnectionError {
     #[error("zero increment in window update frame for stream")]
     WindowUpdateZeroIncrement,
 
+    #[error("received window update that made the window size overflow")]
+    WindowUpdateOverflow,
+
     #[error("received window update frame with invalid length {len}")]
     WindowUpdateInvalidLength { len: usize },
 }
@@ -189,6 +299,8 @@ impl H2ConnectionError {
             H2ConnectionError::PingFrameInvalidLength { .. } => KnownErrorCode::FrameSizeError,
             H2ConnectionError::SettingsAckWithPayload { .. } => KnownErrorCode::FrameSizeError,
             H2ConnectionError::WindowUpdateInvalidLength { .. } => KnownErrorCode::FrameSizeError,
+            // flow control errors
+            H2ConnectionError::WindowUpdateOverflow => KnownErrorCode::FlowControlError,
             // compression errors
             H2ConnectionError::CompressionError(_) => KnownErrorCode::CompressionError,
             // stream closed error
@@ -227,6 +339,9 @@ pub(crate) enum H2StreamError {
 
     #[error("received RST_STREAM frame with invalid size, expected 4 got {frame_size}")]
     InvalidRstStreamFrameSize { frame_size: u32 },
+
+    #[error("received WINDOW_UPDATE that made the window size overflow")]
+    WindowUpdateOverflow,
 }
 
 impl H2StreamError {
@@ -235,10 +350,15 @@ impl H2StreamError {
         use KnownErrorCode as Code;
 
         match self {
+            // stream closed error
             StreamClosed => Code::StreamClosed,
+            // stream refused error
             RefusedStream => Code::RefusedStream,
+            // frame size errors
             InvalidPriorityFrameSize { .. } => Code::FrameSizeError,
             InvalidRstStreamFrameSize { .. } => Code::FrameSizeError,
+            // flow control errors
+            WindowUpdateOverflow => Code::FlowControlError,
             _ => Code::ProtocolError,
         }
     }

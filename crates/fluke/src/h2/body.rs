@@ -8,16 +8,24 @@ pub(crate) enum PieceOrTrailers {
     Trailers(Box<Headers>),
 }
 
-pub(crate) type H2BodySender = mpsc::Sender<H2BodyItem>;
+pub(crate) struct StreamIncoming {
+    // TODO: don't allow access to tx, check against capacity first?
+    pub(crate) tx: mpsc::Sender<StreamIncomingItem>,
+
+    // incoming capacity (that we decide, we get to tell
+    // the peer how much we can handle with window updates)
+    pub(crate) capacity: u32,
+}
+
 // FIXME: don't use eyre, do proper error handling
-pub(crate) type H2BodyItem = eyre::Result<PieceOrTrailers>;
+pub(crate) type StreamIncomingItem = eyre::Result<PieceOrTrailers>;
 
 #[derive(Debug)]
 pub(crate) struct H2Body {
     pub(crate) content_length: Option<u64>,
     pub(crate) eof: bool,
     // TODO: more specific error handling
-    pub(crate) rx: mpsc::Receiver<H2BodyItem>,
+    pub(crate) rx: mpsc::Receiver<StreamIncomingItem>,
 }
 
 impl Body for H2Body {

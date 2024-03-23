@@ -22,3 +22,4 @@ eyre = { version = "0.6.12", default-features = false }
 tracing = "0.1.40"
 http = "1.1.0"
 pretty-hex = "0.4.1"
+color-eyre = "0.6.3"
