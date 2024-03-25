@@ -1,6 +1,6 @@
 [package]
 name = "fluke-buffet"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bearcove/fluke"
@@ -20,7 +20,7 @@ miri = []
 [dependencies]
 eyre = "0.6.12"
 http = "1.1.0"
-fluke-maybe-uring = { version = "0.1.1", path = "../fluke-maybe-uring" }
+fluke-maybe-uring = { version = "0.1.2", path = "../fluke-maybe-uring" }
 memchr = "2.7.1"
 memmap2 = { version = "0.9.4", default-features = false }
 nom = "7.1.3"

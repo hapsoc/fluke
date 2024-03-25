@@ -1,6 +1,6 @@
 [package]
 name = "fluke"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bearcove/fluke"
@@ -24,10 +24,10 @@ enum-repr = "0.2.6"
 enumflags2 = "0.7.9"
 eyre = { version = "0.6.12", default-features = false }
 futures-util = "0.3.30"
-fluke-buffet = { version = "0.1.0", path = "../fluke-buffet" }
-fluke-hpack = { version = "0.3.0", path = "../fluke-hpack" }
+fluke-buffet = { version = "0.1.1", path = "../fluke-buffet" }
+fluke-hpack = { version = "0.3.1", path = "../fluke-hpack" }
 http = "1.1.0"
-fluke-maybe-uring = { version = "0.1.1", path = "../fluke-maybe-uring" }
+fluke-maybe-uring = { version = "0.1.2", path = "../fluke-maybe-uring" }
 memchr = "2.7.1"
 nom = { version = "7.1.3", default-features = false }
 pretty-hex = { version = "0.4.1", default-features = false }
@@ -41,7 +41,7 @@ tokio = { version = "1.36.0", features = ["macros", "sync"] }
 tracing = { version = "0.1.40", default-features = false }
 
 [dev-dependencies]
-fluke-maybe-uring = { version = "0.1.1", path = "../fluke-maybe-uring", features = [
+fluke-maybe-uring = { version = "0.1.2", path = "../fluke-maybe-uring", features = [
     "net",
 ] }
 bytes = { version = "1.5.0", default-features = false }

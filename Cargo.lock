@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "fluke"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "byteorder",
  "bytes",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "fluke-buffet"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eyre",
  "fluke-maybe-uring",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "fluke-hpack"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "hex",
  "serde",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "fluke-maybe-uring"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytemuck",
  "tokio",
